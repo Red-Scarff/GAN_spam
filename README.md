@@ -100,6 +100,9 @@ $$
 \mathcal{L}_D = -\mathbb{E}_{x_{normal}}{\log(1 - D(x_{normal}))} - \mathbb{E}_{x_{spam}}{\log D(x_{spam})} - \mathbb{E}_{\hat{x} \sim p_G(\hat{x})}{\log D(\hat{x})}
 $$
 
+![image](README.assets/110925.png)
+
+
 * **第一项**: 针对**真实正常文本** ($x_{normal}$)。判别器应该将其判断为"正常"，因此希望 $D(x_{normal})$ 接近 0，即 $\log(1 - D(x_{normal}))$ 接近 0。
 * **第二项**: 针对**真实垃圾文本** ($x_{spam}$)。判别器应该将其判断为"垃圾"，因此希望 $D(x_{spam})$ 接近 1，即 $\log D(x_{spam})$ 接近 0。
 * **第三项**: 针对**生成垃圾文本** ($\hat{x}$)。判别器也应该将其判断为"垃圾"，因此希望 $D(\hat{x})$ 接近 1，即 $\log D(\hat{x})$ 接近 0。
