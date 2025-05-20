@@ -96,9 +96,6 @@ $$
 
 判别器训练的目标是最小化其损失函数 $\mathcal{L}_D$，使其能够准确区分不同类别的文本。这里的 $D(x)$ 表示判别器判断输入 $x$ 为"垃圾"的概率。
 
-$$
-\mathcal{L}_D = -\mathbb{E}_{x_{normal}}{\log(1 - D(x_{normal}))} - \mathbb{E}_{x_{spam}}{\log D(x_{spam})} - \mathbb{E}_{\hat{x} \sim p_G(\hat{x})}{\log D(\hat{x})}
-$$
 
 ![image](README.assets/110925.png)
 
