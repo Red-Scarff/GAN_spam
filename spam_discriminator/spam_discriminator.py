@@ -6,7 +6,6 @@ from tqdm import tqdm
 import re
 from gensim.models import Word2Vec
 from sklearn.metrics import confusion_matrix, classification_report
-from utils import *
 
 class SpamDiscriminator(nn.Module):
     def __init__(self, embedding_dim=100, hidden_dim=128, dynamic_threshold=True, 
@@ -17,11 +16,15 @@ class SpamDiscriminator(nn.Module):
         self.hidden_dim = hidden_dim
         self.dynamic_threshold = dynamic_threshold
         self.threshold = nn.Parameter(torch.tensor(threshold_init), requires_grad=dynamic_threshold)
+        
+        # 自注意力机制的投影层
         self.char_similarity_projection = nn.Linear(embedding_dim, hidden_dim)
         self.query_proj = nn.Linear(embedding_dim, hidden_dim)
         self.key_proj = nn.Linear(embedding_dim, hidden_dim)
         self.value_proj = nn.Linear(embedding_dim, hidden_dim)
         self.attention_scale = hidden_dim ** -0.5
+        
+        # 分类器
         self.classifier = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim // 2),
             nn.ReLU(),
@@ -32,13 +35,8 @@ class SpamDiscriminator(nn.Module):
         self.char_vectors = {}
         self.w2v_vectors = {}
 
-        
         # 移动所有参数到指定设备
         self.to(self.device)
-        
-        # # 调试：检查参数设备
-        # for name, param in self.named_parameters():
-        #     print(f"参数 {name} 在设备: {param.device}")
 
     def _generate_w2v_vectors(self, tokenized_texts, d=100):
         """
@@ -103,15 +101,49 @@ class SpamDiscriminator(nn.Module):
             char_vectors[character] = emb
         return char_vectors
 
-    def _generate_sentence_vectors(self, texts):
+    def _apply_self_attention_to_chars(self, char_tensors):
         """
-        根据字符相似性网络生成句子向量表示
+        对单个句子的字符向量应用自注意力机制
+        
+        Args:
+            char_tensors: 字符向量张量 [seq_len, embedding_dim]
+            
+        Returns:
+            sentence_vector: 经过自注意力处理后的句子向量 [hidden_dim]
+        """
+        if char_tensors.dim() != 2:
+            raise ValueError(f"预期输入张量为 2D，实际形状为 {char_tensors.shape}")
+        
+        seq_len, embedding_dim = char_tensors.shape
+        
+        # 投影到查询、键、值
+        queries = self.query_proj(char_tensors)  # [seq_len, hidden_dim]
+        keys = self.key_proj(char_tensors)      # [seq_len, hidden_dim]
+        values = self.value_proj(char_tensors)  # [seq_len, hidden_dim]
+        
+        # 计算注意力分数
+        attention_scores = torch.matmul(queries, keys.transpose(-2, -1)) * self.attention_scale  # [seq_len, seq_len]
+        attention_weights = F.softmax(attention_scores, dim=-1)  # [seq_len, seq_len]
+        
+        # 应用注意力权重
+        attention_output = torch.matmul(attention_weights, values)  # [seq_len, hidden_dim]
+        
+        # 聚合为单个句子向量（可以使用平均池化、最大池化或其他方法）
+        sentence_vector = torch.mean(attention_output, dim=0)  # [hidden_dim]
+        
+        return sentence_vector
+
+    def _generate_sentence_vectors_with_attention(self, texts):
+        """
+        根据字符相似性网络和自注意力机制生成句子向量表示
         """
         sentence_vectors = []
         for text in texts:
             if not text or not isinstance(text, str):
-                sentence_vectors.append(torch.zeros(self.embedding_dim, dtype=torch.float32, device=self.device))
+                # 对于空文本，返回零向量
+                sentence_vectors.append(torch.zeros(self.hidden_dim, dtype=torch.float32, device=self.device))
                 continue
+                
             char_tensors = []
             for char in text:
                 if char in self.char_vectors:
@@ -119,46 +151,19 @@ class SpamDiscriminator(nn.Module):
                 else:
                     char_vec = torch.zeros(self.embedding_dim, dtype=torch.float32, device=self.device)
                 char_tensors.append(char_vec)
+                
             if not char_tensors:
-                sentence_vectors.append(torch.zeros(self.embedding_dim, dtype=torch.float32, device=self.device))
+                sentence_vectors.append(torch.zeros(self.hidden_dim, dtype=torch.float32, device=self.device))
                 continue
-            char_matrix = torch.stack(char_tensors)
-            alpha = torch.matmul(char_matrix, char_matrix.t()) / (self.embedding_dim ** 0.5)
-            alpha_exp = torch.exp(alpha)
-            alpha_sum = alpha_exp.sum(dim=1, keepdim=True)
-            alpha_hat = alpha_exp / (alpha_sum + 1e-8)
-            m = torch.zeros(self.embedding_dim, dtype=torch.float32, device=self.device)
-            for i in range(len(text)):
-                mi = torch.matmul(alpha_hat[i].unsqueeze(0), char_matrix).squeeze(0)
-                m += mi
-            m = m / self.embedding_dim
-            sentence_vectors.append(m)
-        return sentence_vectors
-
-    def _apply_self_attention(self, sentence_tensors):
-        """
-        应用自注意力机制处理句子向量
-        
-        Args:
-            sentence_tensors: 句子向量张量 [batch_size, embedding_dim]
+                
+            # 堆叠字符向量
+            char_matrix = torch.stack(char_tensors)  # [seq_len, embedding_dim]
             
-        Returns:
-            attention_output: 经过自注意力处理后的向量 [batch_size, hidden_dim]
-        """
-        if sentence_tensors.dim() != 2:
-            raise ValueError(f"预期输入张量为 2D，实际形状为 {sentence_tensors.shape}")
-        # 调试：检查张量和参数设备
-        #print(f"sentence_tensors 设备: {sentence_tensors.device}")
-        #print(f"query_proj.weight 设备: {self.query_proj.weight.device}")
-        
-        queries = self.query_proj(sentence_tensors)  # [batch_size, hidden_dim]
-        keys = self.key_proj(sentence_tensors)      # [batch_size, hidden_dim]
-        values = self.value_proj(sentence_tensors)  # [batch_size, hidden_dim]
-        attention_scores = torch.matmul(queries, keys.transpose(-2, -1)) * self.attention_scale
-        attention_weights = F.softmax(attention_scores, dim=-1)
-        attention_output = torch.matmul(attention_weights, values)  # [batch_size, hidden_dim]
-        
-        return attention_output  # 直接返回 [batch_size, hidden_dim]
+            # 对每个句子单独应用自注意力
+            sentence_vector = self._apply_self_attention_to_chars(char_matrix)  # [hidden_dim]
+            sentence_vectors.append(sentence_vector)
+            
+        return sentence_vectors
 
     def fit(self, texts, labels, chinese_characters, chinese_characters_count, 
             sim_mat, test_size=0.5, random_state=42,
@@ -166,12 +171,6 @@ class SpamDiscriminator(nn.Module):
         """
         训练判别器模型
         """
-        # 调试信息
-        # print(f"texts 长度: {len(texts)}, 示例: {texts[:2]}")
-        # print(f"labels 长度: {len(labels)}, 示例: {labels[:2]}")
-        # print(f"chinese_characters 长度: {len(chinese_characters)}")
-        # print(f"sim_mat 类型: {type(sim_mat)}, 形状: {np.array(sim_mat).shape}")
-        
         # 检查标签格式
         if not all(label in ["spam", "normal"] for label in labels):
             raise ValueError("标签必须为 'spam' 或 'normal'")
@@ -181,16 +180,17 @@ class SpamDiscriminator(nn.Module):
         
         optimizer = torch.optim.Adam(self.parameters(), lr=learning_rate)
         criterion = nn.BCELoss()
+        
         print("文本预处理")
         cleaned_texts = self._clean_texts(texts)
         tokenized_texts = self._tokenize_and_remove_stopwords(cleaned_texts)
+        
         print("生成词向量和字符向量")
         self.w2v_vectors = self._generate_w2v_vectors(tokenized_texts)
         self.char_vectors = self._generate_char_vectors(
             chinese_characters, self.w2v_vectors, sim_mat, 
             tokenized_texts, chinese_characters_count
         )
-        #print(f"char_vectors 示例: {list(self.char_vectors.items())[:2]}")
         
         print("划分训练集和测试集...")
         from sklearn.model_selection import train_test_split
@@ -202,9 +202,11 @@ class SpamDiscriminator(nn.Module):
         train_labels_tensor = torch.tensor([1.0 if label == "spam" else 0.0 
                                         for label in train_labels_split], 
                                         dtype=torch.float32, device=self.device)
+        
         history = {
             "train_loss": [], "train_acc": [], "test_loss": [], "test_acc": []
         }
+        
         for epoch in range(epochs):
             print(f"\nEpoch {epoch+1}/{epochs}:")
             self.train()
@@ -212,30 +214,38 @@ class SpamDiscriminator(nn.Module):
             correct = 0
             train_shuffle_indices = list(range(len(train_texts)))
             np.random.shuffle(train_shuffle_indices)
+            
             for i in range(0, len(train_shuffle_indices), batch_size):
                 batch_indices = train_shuffle_indices[i:i+batch_size]
                 batch_texts = [train_texts[idx] for idx in batch_indices]
                 batch_labels = train_labels_tensor[batch_indices]
-                batch_sentence_vectors = self._generate_sentence_vectors(batch_texts)
-                batch_sentence_tensors = torch.stack(batch_sentence_vectors)
-                #print(f"批次大小: {len(batch_texts)}, 张量形状: {batch_sentence_tensors.shape}, 设备: {batch_sentence_tensors.device}")
+                
+                # 生成句子向量（已经应用了自注意力）
+                batch_sentence_vectors = self._generate_sentence_vectors_with_attention(batch_texts)
+                batch_sentence_tensors = torch.stack(batch_sentence_vectors)  # [batch_size, hidden_dim]
+                
                 optimizer.zero_grad()
-                attention_output = self._apply_self_attention(batch_sentence_tensors)  # [batch_size, hidden_dim]
-                predictions = self.classifier(attention_output).squeeze(-1)  # [batch_size]
-                #print(f"predictions 形状: {predictions.shape}, batch_labels 形状: {batch_labels.shape}")
+                
+                # 直接用于分类，不再需要额外的自注意力层
+                predictions = self.classifier(batch_sentence_tensors).squeeze(-1)  # [batch_size]
+                
                 loss = criterion(predictions, batch_labels)
                 loss.backward()
                 optimizer.step()
+                
                 total_loss += loss.item()
                 predictions_binary = (predictions >= 0.5).float()
                 correct += (predictions_binary == batch_labels).sum().item()
+            
             train_loss = total_loss / (len(train_shuffle_indices) / batch_size)
             train_acc = correct / len(train_texts)
             history["train_loss"].append(train_loss)
             history["train_acc"].append(train_acc)
+            
             test_loss, test_acc = self.evaluate(test_texts, test_labels_split)
             history["test_loss"].append(test_loss)
             history["test_acc"].append(test_acc)
+            
             print(f"Epoch {epoch+1}/{epochs}: 训练损失={train_loss:.4f}, 训练准确率={train_acc:.4f}, "
                 f"测试损失={test_loss:.4f}, 测试准确率={test_acc:.4f}")
 
@@ -251,15 +261,14 @@ class SpamDiscriminator(nn.Module):
         Returns:
             predictions: 垃圾文本预测概率 [batch_size]
         """
-
         print("开始前向传播...")
-        sentence_vectors = self._generate_sentence_vectors(texts)
-        sentence_tensors = torch.stack(sentence_vectors)
-        attention_output = self._apply_self_attention(sentence_tensors)  # [batch_size, hidden_dim]
-        predictions = self.classifier(attention_output).squeeze(-1)  # [batch_size]
+        # 生成句子向量（已经应用了自注意力）
+        sentence_vectors = self._generate_sentence_vectors_with_attention(texts)
+        sentence_tensors = torch.stack(sentence_vectors)  # [batch_size, hidden_dim]
+        
+        # 直接用于分类
+        predictions = self.classifier(sentence_tensors).squeeze(-1)  # [batch_size]
         return predictions
-
-    
 
     def evaluate(self, texts, labels):
         """
@@ -280,7 +289,6 @@ class SpamDiscriminator(nn.Module):
                                     dtype=torch.float32, device=self.device)
         with torch.no_grad():
             predictions = self(texts)
-            print(f"evaluate predictions 形状: {predictions.shape}, labels_tensor 形状: {labels_tensor.shape}")
             loss = criterion(predictions, labels_tensor)
             predictions_binary = (predictions >= 0.5).float()
             accuracy = (predictions_binary == labels_tensor).sum().item() / len(texts)
@@ -291,6 +299,8 @@ class SpamDiscriminator(nn.Module):
         with torch.no_grad():
             probabilities = self(texts).cpu().numpy()
             predictions = (probabilities >= 0.5).astype(int)
+        print(f"判别结果: {predictions}")
+        print(f"判别概率: {probabilities}")
         return predictions, probabilities
 
     def gan_loss(self, real_normal_texts, real_spam_texts, generated_texts):
@@ -312,20 +322,23 @@ class SpamDiscriminator(nn.Module):
         real_normal_preds = self(real_normal_texts)
         real_normal_labels = torch.zeros(len(real_normal_texts), dtype=torch.float32, device=self.device)
         loss_real_normal = F.binary_cross_entropy(real_normal_preds, real_normal_labels)
+        
         real_spam_preds = self(real_spam_texts)
         real_spam_labels = torch.ones(len(real_spam_texts), dtype=torch.float32, device=self.device)
         loss_real_spam = F.binary_cross_entropy(real_spam_preds, real_spam_labels)
+        
         generated_preds = self(generated_texts)
         generated_labels = torch.ones(len(generated_texts), dtype=torch.float32, device=self.device)
         loss_generated = F.binary_cross_entropy(generated_preds, generated_labels)
+        
         total_loss = loss_real_normal + loss_real_spam + loss_generated
+        
         real_normal_acc = ((real_normal_preds < 0.5).float().mean()).item()
         real_spam_acc = ((real_spam_preds >= 0.5).float().mean()).item()
         generated_acc = ((generated_preds >= 0.5).float().mean()).item()
+        
         return total_loss, real_normal_acc, real_spam_acc, generated_acc
 
-
-    
     def get_reward_for_generator(self, generated_texts, original_texts=None, lambda_param=0.7):
         """
         为生成器提供奖励信号
@@ -430,8 +443,6 @@ class SpamDiscriminator(nn.Module):
             
         return tokenized_texts
     
-    
-    
     def _update_w2v_vectors(self, w2v_vectors, texts, character, d=100):
         """
         更新词向量
@@ -451,8 +462,6 @@ class SpamDiscriminator(nn.Module):
             w2v_vectors[character] = word_vectors[character]
             
         return w2v_vectors
-    
-
     
     def save(self, filepath):
         """
@@ -499,58 +508,3 @@ class SpamDiscriminator(nn.Module):
         model.to(device)
         
         return model
-
-
-"""
-#示例用法
-class GANSpamDetector:
-    
-    def __init__(self, discriminator=None, generator=None, device=None):
-
-        self.device = device if device else torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        
-        # 初始化判别器和生成器
-        self.discriminator = discriminator if discriminator else SpamDiscriminator(device=self.device)
-        self.generator = generator
-        
-    def train_discriminator(self, real_normal_texts, real_spam_texts, generated_texts=None, 
-                          optimizer=None, epochs=1):
-
-        if optimizer is None:
-            optimizer = torch.optim.Adam(self.discriminator.parameters(), lr=0.001)
-            
-        metrics = {
-            'loss': [],
-            'real_normal_acc': [],
-            'real_spam_acc': [],
-            'generated_acc': []
-        }
-        
-        # 如果没有生成文本，使用空列表
-        if generated_texts is None:
-            generated_texts = []
-            
-        for epoch in range(epochs):
-            # 计算GAN损失
-            loss, real_normal_acc, real_spam_acc, generated_acc = self.discriminator.gan_loss(
-                real_normal_texts, real_spam_texts, generated_texts
-            )
-            
-            # 反向传播
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-            
-            # 记录指标
-            metrics['loss'].append(loss.item())
-            metrics['real_normal_acc'].append(real_normal_acc)
-            metrics['real_spam_acc'].append(real_spam_acc)
-            metrics['generated_acc'].append(generated_acc)
-            
-            print(f"Epoch {epoch+1}/{epochs}: Loss={loss.item():.4f}, "
-                  f"Normal Acc={real_normal_acc:.4f}, Spam Acc={real_spam_acc:.4f}, "
-                  f"Generated Acc={generated_acc:.4f}")
-            
-        return metrics
-
-"""
