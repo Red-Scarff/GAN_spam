@@ -1,6 +1,6 @@
 from pypinyin import pinyin, Style
-from four_corner_method import FourCornerMethod
-from ssc_similarity import *
+from .four_corner_method import FourCornerMethod
+from spam_discriminator.ssc_similarity import *
 from tqdm import tqdm
 import pickle
 import numpy as np
@@ -17,7 +17,7 @@ class ChineseCharacterCoder:
                                 '51':'p'}
 
         # 加载汉字结构对照文件
-        with open('./数据集/hanzijiegou_2w.txt', 'r', encoding='utf-8') as file:
+        with open('./data/hanzijiegou_2w.txt', 'r', encoding='utf-8') as file:
             for line in file:
                 parts = line.strip().split('\t')
                 if len(parts) == 2:
@@ -26,7 +26,7 @@ class ChineseCharacterCoder:
 
         # 加载汉字笔画对照文件，参考同级目录下的 chinese_unicode_table.txt 文件格式
         self.chinese_char_map = {}
-        with open('./数据集/chinese_unicode_table.txt', 'r', encoding='UTF-8') as f:
+        with open('./data/chinese_unicode_table.txt', 'r', encoding='UTF-8') as f:
             lines = f.readlines()
             for line in lines[6:]:  # 前6行是表头，去掉
                 line_info = line.strip().split()
@@ -110,8 +110,10 @@ class ChineseCharacterCoder:
         return pronunciation_code
 
     def generate_glyph_code(self, hanzi):
-        # 获取汉字的结构
-        structure_code = self.structure_dict[hanzi]
+        if hanzi not in self.structure_dict: 
+            structure_code = '0'
+        else:# 获取汉字的结构
+            structure_code = self.structure_dict[hanzi]
 
         # 获取汉字的四角编码
         fcc = FourCornerMethod().query(hanzi)
@@ -127,7 +129,7 @@ class ChineseCharacterCoder:
     def generate_character_code(self, hanzi):
         return self.generate_pronunciation_code(hanzi) + self.generate_glyph_code(hanzi)
 
-# 统计数据集中的所有汉字以及对应的出现次数，并对其进行编码
+# 统计data中的所有汉字以及对应的出现次数，并对其进行编码
 def count_chinese_characters(content, output_file_path):
     chinese_characters = []
     chinese_characters_count = {}
@@ -175,7 +177,7 @@ def compute_sim_mat(chinese_characters, chinese_characters_code):
             sim_mat[j][i] = similarity
 
     # 将结果保存到pkl文件
-    output_file = './数据集/similarity_matrix.pkl'
+    output_file = './data/similarity_matrix.pkl'
     with open(output_file, 'wb') as f:
         pickle.dump(sim_mat, f)
 
@@ -212,7 +214,7 @@ def update_sim_mat(new_characters, chinese_characters_code, sim_mat):
             sim_mat[j][i] = similarity
 
     # 将结果写入文件
-    output_file = '第四章/高阶示例/数据集/similarity_matrix.txt'
+    output_file = '第四章/高阶示例/data/similarity_matrix.txt'
     with open(output_file, 'w', encoding='utf-8') as f:
         for row in sim_mat:
             f.write('\t'.join(map(str, row)) + '\n')
