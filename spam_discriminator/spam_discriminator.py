@@ -47,6 +47,7 @@ class SpamDiscriminator(nn.Module):
             return {}
         # 将字符串拆分为字符列表
         tokenized_texts = [[char for char in text] for text in tokenized_texts]
+        
         model = Word2Vec(sentences=tokenized_texts, vector_size=d, window=5, min_count=1, sg=0)
         word_vectors = model.wv
         w2v_vectors = {}
@@ -81,7 +82,7 @@ class SpamDiscriminator(nn.Module):
         vec_dim = self.embedding_dim
         
         char_vectors = {}
-        for i in range(len(chinese_characters)):
+        for i in tqdm(range(len(chinese_characters)), desc="处理汉字"):
             character = chinese_characters[i]
             similar_indices = torch.where(sim_mat_tensor[i] >= threshold_value)[0].cpu().numpy()
             similar_group = [chinese_characters[j] for j in similar_indices]
@@ -89,6 +90,7 @@ class SpamDiscriminator(nn.Module):
             emb = torch.zeros(vec_dim, dtype=torch.float32, device=self.device)
             for c in similar_group:
                 if c not in w2v_vectors:
+                    texts = [[char for char in text] for text in texts]
                     self._update_w2v_vectors(w2v_vectors, texts, c, vec_dim)
                 if c in w2v_vectors:
                     # 直接使用存储的张量
@@ -171,9 +173,7 @@ class SpamDiscriminator(nn.Module):
         """
         训练判别器模型
         """
-        # 检查标签格式
-        if not all(label in ["spam", "normal"] for label in labels):
-            raise ValueError("标签必须为 'spam' 或 'normal'")
+        
         
         # 确保模型参数在正确设备上
         self.to(self.device)
@@ -187,6 +187,7 @@ class SpamDiscriminator(nn.Module):
         
         print("生成词向量和字符向量")
         self.w2v_vectors = self._generate_w2v_vectors(tokenized_texts)
+        
         self.char_vectors = self._generate_char_vectors(
             chinese_characters, self.w2v_vectors, sim_mat, 
             tokenized_texts, chinese_characters_count
@@ -199,7 +200,7 @@ class SpamDiscriminator(nn.Module):
         )
         train_texts = [texts[i] for i in train_indices]
         test_texts = [texts[i] for i in test_indices]
-        train_labels_tensor = torch.tensor([1.0 if label == "spam" else 0.0 
+        train_labels_tensor = torch.tensor([1.0 if label == "1" else 0.0 
                                         for label in train_labels_split], 
                                         dtype=torch.float32, device=self.device)
         
@@ -284,7 +285,7 @@ class SpamDiscriminator(nn.Module):
         """
         self.eval()
         criterion = nn.BCELoss()
-        labels_tensor = torch.tensor([1.0 if label == "spam" else 0.0 
+        labels_tensor = torch.tensor([1.0 if label == "1" else 0.0 
                                     for label in labels], 
                                     dtype=torch.float32, device=self.device)
         with torch.no_grad():
@@ -299,8 +300,6 @@ class SpamDiscriminator(nn.Module):
         with torch.no_grad():
             probabilities = self(texts).cpu().numpy()
             predictions = (probabilities >= 0.5).astype(int)
-        print(f"判别结果: {predictions}")
-        print(f"判别概率: {probabilities}")
         return predictions, probabilities
 
     def gan_loss(self, real_normal_texts, real_spam_texts, generated_texts):
