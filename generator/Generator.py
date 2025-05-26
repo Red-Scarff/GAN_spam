@@ -80,8 +80,9 @@ class Generator(nn.Module):
         
         print("Generator 生成数据交由判别器评估")
         
-        _, prob_normal = discriminator.discriminate(generated_texts)  # returns (preds, probs)
+        _, prob_spam = discriminator.discriminate(generated_texts)  # returns (preds, probs)
         
+        prob_normal = 1 - prob_spam
     
         prob_normal = torch.tensor(prob_normal, dtype=torch.float32, device=input_ids.device)  # [B]
         
@@ -247,7 +248,9 @@ class ReplacementPolicy(nn.Module):
 
         # 使用 discriminator 判别是否是“正常文本”
         generated_texts = self.tokenizer.batch_decode(gen_ids, skip_special_tokens=True)
-        _, prob_normal = discriminator.discriminate(generated_texts)
+        _, prob_spam = discriminator.discriminate(generated_texts)
+        
+        prob_normal = 1 - prob_spam
 
         prob_normal = torch.tensor(prob_normal, dtype=torch.float32, device=input_ids.device)
         dis_loss = -torch.log(torch.clamp(prob_normal, min=1e-8)).mean()
