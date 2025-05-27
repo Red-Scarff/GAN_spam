@@ -67,16 +67,12 @@ def main():
     # discriminator = SpamDiscriminator(embedding_dim=100, hidden_dim=128, device=device)
     discriminator = SpamDiscriminator.load("./spam_discriminator/spam_discriminator_model.pth", device)
     
-    a = discriminator.discriminate(pos_train_texts[:20])
-    
-    print(a)
-
     # 初始化 Generator
-    # generator = Generator(
-    #     hidden_dim=768,
-    #     computeSSCSimilarity=Similarity,
-    #     lambda_sim=1.0
-    # ).to(device)
+    G = Generator(
+        hidden_dim=768,
+        computeSSCSimilarity=Similarity,
+        lambda_sim=1.0
+    ).to(device)
     
     # 读取Generator
     # generator.load_state_dict(torch.load('./generator/generator_model.pt'))
@@ -106,7 +102,20 @@ def main():
     
     # sen = "我是清华代培的学生。刚进校的时候我也对清华抱有很高的期望，当时确实觉得很多事情让我失望。然而在这里两年多了，我觉得清华的所有人没有把我们当外人，我在各种活动、学业中找到了自己，并且还在坚持自己的梦想。我和我的同学们都感激清华。积极适应吧，我觉得清华还是给人提供了很大的空间的，关键是自己要学会利用。 赞一下 如果是真的,可见原作者是一个有理想有想法的人"
     
-    # G = ReplacementPolicy(hidden_dim=768, computeSSCSimilarity=Similarity).to(device)
+    gen = []
+    for t in range(0, 100):
+        now = G.generate(pos_train_texts[t])
+        gen.append(now)
+        
+    print(gen[:10], discriminator.discriminate(gen))
+    
+    G.train_model(neg_train_texts, discriminator)
+    
+    gen = []
+    for t in range(0, 100):
+        now = G.generate(pos_train_texts[t])
+        gen.append(now)
+    print(gen[:10], discriminator.discriminate(gen))
     
     # gen = []
     # tag_gen = []

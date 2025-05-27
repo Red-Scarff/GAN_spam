@@ -11,7 +11,7 @@ class Generator(nn.Module):
     def __init__(self, 
                  hidden_dim: int, 
                  computeSSCSimilarity,
-                 lambda_sim: float = 1.0,
+                 lambda_sim: float = 0.3,
                  bert_model_name: str = 'bert-base-chinese'):
         super().__init__()
         self.bert = BertModel.from_pretrained(bert_model_name)
@@ -44,21 +44,48 @@ class Generator(nn.Module):
                     continue
                 sim_matrix[i][j] = sim_matrix[j][i] = self.computeSSCSimilarity(tok_i, tok_j)
         return torch.tensor(sim_matrix, dtype=torch.float32)
-
-
+    
     def forward(self, input_ids, attention_mask, discriminator):
         outputs = self.bert(input_ids=input_ids, attention_mask=attention_mask)
         seq_out = outputs.last_hidden_state  # [B, T, H]
 
-        mask_logits = self.mask_head(seq_out).squeeze(-1)  # [B, T]
-        mask_probs = torch.sigmoid(mask_logits)           # [B, T]
-
-        rep_logits = self.replace_head(seq_out)           # [B, T, V]
-        rep_probs = F.gumbel_softmax(rep_logits, tau=0.5, hard=True)  # [B, T, V]
-
-        # === 计算相似度损失 ===
-        print("=== Generator 计算相似度损失 ===")
+        mask_logits = self.mask_head(seq_out).squeeze(-1)    # [B, T]
+        mask_probs = torch.sigmoid(mask_logits)              # [B, T]
         B, T = input_ids.shape
+
+        rep_logits = self.replace_head(seq_out)              # [B, T, V]
+        rep_probs = F.gumbel_softmax(rep_logits, tau=0.5, hard=True)  # [B, T, V]
+        rep_ids = rep_probs.argmax(dim=-1)                   # [B, T]
+
+        # === 采样 mask 动作（是否替换） ===
+        mask_actions = torch.bernoulli(mask_probs).to(dtype=torch.bool)  # [B, T]
+
+        # === 构造最终生成 id ===
+        gen_ids = input_ids.clone()
+        gen_ids[mask_actions] = rep_ids[mask_actions]
+
+        # === 计算 log_prob of actions ===
+        # 对 rep_probs 做 log，再根据 rep_ids 拿到 log_prob
+        log_rep_probs = torch.log_softmax(rep_logits, dim=-1)  # [B, T, V]
+        log_p_replace = torch.gather(log_rep_probs, dim=-1, index=rep_ids.unsqueeze(-1)).squeeze(-1)  # [B, T]
+
+        # mask 动作的 log prob
+        log_p_mask = torch.log(mask_probs + 1e-8)              # [B, T]
+        log_p_nomask = torch.log(1 - mask_probs + 1e-8)        # [B, T]
+        log_p_mask_action = torch.where(mask_actions, log_p_mask + log_p_replace, log_p_nomask)  # [B, T]
+
+        # sum over time
+        log_prob_total = log_p_mask_action.sum(dim=1)  # [B]
+
+        # === 获取生成文本并评估 reward ===
+        generated_texts = self.tokenizer.batch_decode(gen_ids, skip_special_tokens=True)
+        _, prob_spam = discriminator.discriminate(generated_texts)
+        prob_normal = 1 - torch.tensor(prob_spam, dtype=torch.float32, device=input_ids.device)  # [B]
+
+        # === policy gradient loss ===
+        rl_loss = -(log_prob_total * prob_normal).mean()
+
+        # === similarity loss ===
         sim_loss = 0.0
         for b in range(B):
             for t in range(T):
@@ -68,34 +95,17 @@ class Generator(nn.Module):
                     continue 
                 sim_vec = self.sim_matrix[orig_id].to(rep_probs.device)  # [V]
                 sim_loss += ((1.0 - sim_vec) * rep_probs[b, t]).sum()
-                
         sim_loss = sim_loss / (B * T)
 
-        one_hot_orig = F.one_hot(input_ids, num_classes=self.vocab_size).float()
-        mask_probs_exp = mask_probs.unsqueeze(-1)
-        token_probs = (1 - mask_probs_exp) * one_hot_orig + mask_probs_exp * rep_probs
-        gen_ids = token_probs.argmax(dim=-1)
-        
-        generated_texts = self.tokenizer.batch_decode(gen_ids, skip_special_tokens=True)
-        
-        print("Generator 生成数据交由判别器评估")
-        
-        _, prob_spam = discriminator.discriminate(generated_texts)  # returns (preds, probs)
-        
-        prob_normal = 1 - prob_spam
-    
-        prob_normal = torch.tensor(prob_normal, dtype=torch.float32, device=input_ids.device)  # [B]
-        
-        dis_loss = -torch.log(torch.clamp(prob_normal, min=1e-8)).mean()
-        total_loss = dis_loss + self.lambda_sim * sim_loss
-        
-        print(f"Generator total loss:{total_loss} dis_loss: {dis_loss} sim_loss: {sim_loss}")
+        total_loss = rl_loss + self.lambda_sim * sim_loss
 
         return {
             "loss": total_loss,
-            "dis_loss": dis_loss,
+            "rl_loss": rl_loss,
             "sim_loss": sim_loss,
-            "gen_ids": gen_ids
+            "gen_ids": gen_ids,
+            "texts": generated_texts,
+            "rewards": prob_normal.detach()
         }
 
     def train_step(self, batch_texts, discriminator, optimizer, device):
@@ -131,7 +141,6 @@ class Generator(nn.Module):
             rep_logits = self.replace_head(seq_out)
             # rep_probs = F.softmax(rep_logits, dim=-1)
             rep_probs = F.gumbel_softmax(rep_logits, tau=0.5, hard=False) 
-
             gen_ids = []
             for t in range(input_ids.size(1)):
                 orig_id = input_ids[0, t].item()
@@ -153,7 +162,7 @@ class Generator(nn.Module):
     def _is_chinese_char(self, token):
         return len(token) == 1 and '\u4e00' <= token <= '\u9fff'
 
-    def train_model(self, train_texts, discriminator, num_epochs=1, batch_size=10, lr=5e-5, device='cuda' if torch.cuda.is_available() else 'cpu'):
+    def train_model(self, train_texts, discriminator, num_epochs=1, batch_size=32, lr=5e-5, device='cuda' if torch.cuda.is_available() else 'cpu'):
         """
         训练过程
         """
@@ -173,17 +182,14 @@ class Generator(nn.Module):
             for batch_texts in tqdm(dataloader, desc=f"Generator Epoch {epoch+1}/{num_epochs}"):
                 result = self.train_step(batch_texts, discriminator, optimizer, device)
                 total_loss += result['loss'].item()
-                total_dis_loss += result['dis_loss'].item()
+                total_dis_loss += result['rl_loss'].item()
                 total_sim_loss += result['sim_loss'].item()
 
             print(f"[Epoch {epoch+1}] Total Loss: {total_loss:.4f} | Dis Loss: {total_dis_loss:.4f} | Sim Loss: {total_sim_loss:.4f}")
 
 
 class ReplacementPolicy(nn.Module):
-    def __init__(self, 
-                 hidden_dim: int, 
-                 computeSSCSimilarity,
-                 bert_model_name: str = 'bert-base-chinese'):
+    def __init__(self, hidden_dim, computeSSCSimilarity, bert_model_name='bert-base-chinese'):
         super().__init__()
         self.bert = BertModel.from_pretrained(bert_model_name)
         self.tokenizer = BertTokenizer.from_pretrained(bert_model_name)
@@ -191,17 +197,14 @@ class ReplacementPolicy(nn.Module):
         self.hidden_dim = hidden_dim
         self.computeSSCSimilarity = computeSSCSimilarity
 
-        # 冻结 BERT 所有参数
         for param in self.bert.parameters():
             param.requires_grad = False
 
-        # 只训练这个线性层，判断是否替换
         self.mask_head = nn.Linear(self.bert.config.hidden_size, 1)
 
-        # vocab 映射
         self.id2token = {i: tok for tok, i in self.tokenizer.vocab.items()}
         self.token2id = self.tokenizer.vocab
-        
+
         print("Computing Generator Similarity_matrix...")
         self.sim_matrix = self._build_similarity_matrix()
         print("Similarity_matrix Computing Finished")
@@ -223,60 +226,64 @@ class ReplacementPolicy(nn.Module):
         return torch.tensor(sim_matrix, dtype=torch.float32)
 
     def forward(self, input_ids, attention_mask, discriminator):
-        with torch.no_grad():  # BERT 不训练
+        with torch.no_grad():
             outputs = self.bert(input_ids=input_ids, attention_mask=attention_mask)
-            seq_out = outputs.last_hidden_state  # [B, T, H]
+            seq_out = outputs.last_hidden_state
 
-        mask_logits = self.mask_head(seq_out).squeeze(-1)  # [B, T]
-        mask_probs = torch.sigmoid(mask_logits)  # [B, T]
-
+        mask_logits = self.mask_head(seq_out).squeeze(-1)
+        mask_probs = torch.sigmoid(mask_logits)
         B, T = input_ids.shape
         gen_ids = input_ids.clone()
 
+        log_probs = []
+        generated_texts = []
+
         for b in range(B):
+            log_prob_sum = torch.tensor(0.0, device=input_ids.device)
             for t in range(T):
                 orig_id = input_ids[b, t].item()
                 orig_token = self.id2token.get(orig_id, '[UNK]')
                 if len(orig_token) != 1 or not self._is_chinese_char(orig_token):
                     continue
 
-                p_mask = mask_probs[b, t].item()
-                if p_mask >= 0.5:
+                p_replace = mask_probs[b, t]
+                action = torch.bernoulli(p_replace).item()
+                
+                log_p = torch.log(p_replace + 1e-8) if action == 1 else torch.log(1 - p_replace + 1e-8)
+                log_prob_sum += log_p
+
+                if action == 1:
                     sim_vec = self.sim_matrix[orig_id].to(input_ids.device)
                     topk_id = torch.argmax(sim_vec).item()
                     gen_ids[b, t] = topk_id
 
-        # 使用 discriminator 判别是否是“正常文本”
-        generated_texts = self.tokenizer.batch_decode(gen_ids, skip_special_tokens=True)
+            gen_text = self.tokenizer.decode(gen_ids[b], skip_special_tokens=True).replace(' ', '')
+            generated_texts.append(gen_text)
+            log_probs.append(log_prob_sum)
+
         _, prob_spam = discriminator.discriminate(generated_texts)
-        
-        prob_normal = 1 - prob_spam
+        prob_normal = 1 - torch.tensor(prob_spam, dtype=torch.float32, device=input_ids.device)
+        reward = prob_normal
+        log_probs = torch.stack(log_probs)
+        rl_loss = -(log_probs * reward).mean()
 
-        prob_normal = torch.tensor(prob_normal, dtype=torch.float32, device=input_ids.device)
-        dis_loss = -torch.log(torch.clamp(prob_normal, min=1e-8)).mean()
-
+        print("loss: ", rl_loss)
         return {
-            "loss": dis_loss,
-            "dis_loss": dis_loss,
-            "gen_ids": gen_ids
+            "loss": rl_loss,
+            "rl_loss": rl_loss,
+            "gen_ids": gen_ids,
+            "texts": generated_texts,
+            "rewards": reward.detach()
         }
-        
-    def train_from_texts(self, 
-                     train_texts,
-                     discriminator,
-                     num_epochs=5, 
-                     batch_size=16, 
-                     lr=1e-4, 
-                     device='cuda'):
-        """
-        使用原始文本训练 mask_head，决定哪些 token 被替换。
-        """
+    
+
+
+    def train_from_texts(self, train_texts, discriminator, num_epochs=1, batch_size=32, lr=1e-4, device='cuda'):
         tokenizer = self.tokenizer
         self.to(device)
         self.train()
         discriminator.eval()
 
-        # 编码文本为 input_ids
         encodings = tokenizer(train_texts, padding=True, truncation=True, return_tensors='pt')
         input_ids = encodings['input_ids']
         attention_mask = encodings['attention_mask']
@@ -284,14 +291,12 @@ class ReplacementPolicy(nn.Module):
         dataset = TensorDataset(input_ids, attention_mask)
         dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
-        # 只训练 mask_head
         optimizer = torch.optim.Adam(self.mask_head.parameters(), lr=lr)
 
         for epoch in range(num_epochs):
             total_loss = 0
-            for batch in dataloader:
+            for batch in tqdm(dataloader, desc="Generator Training"):
                 input_ids_batch, attention_mask_batch = [x.to(device) for x in batch]
-
                 output = self(input_ids_batch, attention_mask_batch, discriminator)
                 loss = output['loss']
 
@@ -302,7 +307,7 @@ class ReplacementPolicy(nn.Module):
                 total_loss += loss.item()
 
             avg_loss = total_loss / len(dataloader)
-            print(f"[Epoch {epoch + 1}/{num_epochs}] Loss: {avg_loss:.4f}")
+            print(f"[Epoch {epoch + 1}/{num_epochs}] RL Loss: {avg_loss:.4f}")
             
     def generate(self, texts, threshold=0.5, device='cuda'):
         """
