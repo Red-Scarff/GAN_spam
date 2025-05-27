@@ -6,6 +6,7 @@ import random
 from tqdm import tqdm
 import numpy as np
 from torch.utils.data import DataLoader, TensorDataset
+from utils import build_sim_matrix
 
 class Generator(nn.Module):
     def __init__(self, 
@@ -189,13 +190,23 @@ class Generator(nn.Module):
 
 
 class ReplacementPolicy(nn.Module):
-    def __init__(self, hidden_dim, computeSSCSimilarity, bert_model_name='bert-base-chinese'):
+    def __init__(self, 
+                 hidden_dim: int, 
+                 computeSSCSimilarity,
+                 bert_model_name: str = 'bert-base-chinese',
+                 sim_matrix_path: str = 'models/sim_matrix.pt',
+                 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu'),
+                 topk: int = 5,
+                 temperature: float = 1.0):
         super().__init__()
         self.bert = BertModel.from_pretrained(bert_model_name)
         self.tokenizer = BertTokenizer.from_pretrained(bert_model_name)
         self.vocab_size = self.bert.config.vocab_size
         self.hidden_dim = hidden_dim
         self.computeSSCSimilarity = computeSSCSimilarity
+        self.topk = topk
+        self.temperature = temperature
+        self.device = device
 
         for param in self.bert.parameters():
             param.requires_grad = False
@@ -205,25 +216,37 @@ class ReplacementPolicy(nn.Module):
         self.id2token = {i: tok for tok, i in self.tokenizer.vocab.items()}
         self.token2id = self.tokenizer.vocab
 
-        print("Computing Generator Similarity_matrix...")
-        self.sim_matrix = self._build_similarity_matrix()
-        print("Similarity_matrix Computing Finished")
+        # 加载或构建相似度矩阵
+        if sim_matrix_path:
+            print(f"Loading similarity matrix from {sim_matrix_path} ...")
+            self.sim_matrix = torch.load(sim_matrix_path, map_location='cpu').to(self.device)
+            print("Loaded similarity matrix.")
+        else:
+            print("Computing Generator Similarity_matrix...")
+            self.sim_matrix = build_sim_matrix(model_name = bert_model_name).to(self.device)
+            print("Similarity_matrix Computing Finished")
 
-    def _is_chinese_char(self, token: str):
-        return '\u4e00' <= token <= '\u9fff'
+        self._precompute_topk_indices()
 
-    def _build_similarity_matrix(self):
-        sim_matrix = np.zeros((self.vocab_size, self.vocab_size), dtype=np.float32)
-        for i in range(self.vocab_size):
-            tok_i = self.id2token[i]
-            if len(tok_i) != 1 or not self._is_chinese_char(tok_i):
-                continue
-            for j in range(i, self.vocab_size):
-                tok_j = self.id2token[j]
-                if len(tok_j) != 1 or not self._is_chinese_char(tok_j):
-                    continue
-                sim_matrix[i][j] = sim_matrix[j][i] = self.computeSSCSimilarity(tok_i, tok_j)
-        return torch.tensor(sim_matrix, dtype=torch.float32)
+    def _precompute_topk_indices(self):
+        """预计算每个token的top-k相似度索引"""
+        print("Precomputing top-k similarity indices...")
+        with tqdm(total=1, desc="Computing top-k indices") as pbar:
+            self.topk_indices = torch.topk(self.sim_matrix, k=self.topk, dim=1).indices
+            pbar.update(1)
+        print("Top-k indices precomputed.")
+
+    def _sample_from_topk(self, similarities, temperature=None):
+        """从top-k相似度中按概率采样"""
+        if temperature is None:
+            temperature = self.temperature
+            
+        # 应用温度缩放
+        scaled_sims = similarities / temperature
+        # 使用softmax计算概率
+        probs = torch.softmax(scaled_sims, dim=-1)
+        # 按概率采样
+        return torch.multinomial(probs, num_samples=1).squeeze(-1)
 
     def forward(self, input_ids, attention_mask, discriminator):
         with torch.no_grad():

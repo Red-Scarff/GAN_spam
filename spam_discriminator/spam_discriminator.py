@@ -6,16 +6,30 @@ from tqdm import tqdm
 import re
 from gensim.models import Word2Vec
 from sklearn.metrics import confusion_matrix, classification_report
+import random
+
+class L2Norm(nn.Module):
+    """L2归一化层"""
+    def __init__(self, dim=-1):
+        super(L2Norm, self).__init__()
+        self.dim = dim
+        
+    def forward(self, x):
+        return F.normalize(x, p=2, dim=self.dim)
 
 class SpamDiscriminator(nn.Module):
     def __init__(self, embedding_dim=100, hidden_dim=128, dynamic_threshold=True, 
-                 threshold_init=0.6, device=None):
+                 threshold_init=0.6, device=None, temperature=0.1, contrastive_weight=0.3,
+                 projection_dim=64):
         super(SpamDiscriminator, self).__init__()
         self.device = device if device else torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.embedding_dim = embedding_dim
         self.hidden_dim = hidden_dim
         self.dynamic_threshold = dynamic_threshold
         self.threshold = nn.Parameter(torch.tensor(threshold_init), requires_grad=dynamic_threshold)
+        self.temperature = temperature
+        self.contrastive_weight = contrastive_weight
+        self.projection_dim = projection_dim
         
         # 自注意力机制的投影层
         self.char_similarity_projection = nn.Linear(embedding_dim, hidden_dim)
@@ -32,6 +46,15 @@ class SpamDiscriminator(nn.Module):
             nn.Linear(hidden_dim // 2, 1),
             nn.Sigmoid()
         )
+
+        # 对比学习投影头
+        self.contrastive_projection = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, projection_dim),
+            L2Norm(dim=-1)  # L2归一化
+        )
+
         self.char_vectors = {}
         self.w2v_vectors = {}
 
@@ -47,7 +70,6 @@ class SpamDiscriminator(nn.Module):
             return {}
         # 将字符串拆分为字符列表
         tokenized_texts = [[char for char in text] for text in tokenized_texts]
-        
         model = Word2Vec(sentences=tokenized_texts, vector_size=d, window=5, min_count=1, sg=0)
         word_vectors = model.wv
         w2v_vectors = {}
@@ -82,7 +104,7 @@ class SpamDiscriminator(nn.Module):
         vec_dim = self.embedding_dim
         
         char_vectors = {}
-        for i in tqdm(range(len(chinese_characters)), desc="处理汉字"):
+        for i in range(len(chinese_characters)):
             character = chinese_characters[i]
             similar_indices = torch.where(sim_mat_tensor[i] >= threshold_value)[0].cpu().numpy()
             similar_group = [chinese_characters[j] for j in similar_indices]
@@ -90,7 +112,6 @@ class SpamDiscriminator(nn.Module):
             emb = torch.zeros(vec_dim, dtype=torch.float32, device=self.device)
             for c in similar_group:
                 if c not in w2v_vectors:
-                    texts = [[char for char in text] for text in texts]
                     self._update_w2v_vectors(w2v_vectors, texts, c, vec_dim)
                 if c in w2v_vectors:
                     # 直接使用存储的张量
@@ -167,13 +188,120 @@ class SpamDiscriminator(nn.Module):
             
         return sentence_vectors
 
+    def contrastive_loss(self, embeddings, labels, temperature=None):
+        """
+        计算对比学习损失（InfoNCE Loss）
+        
+        Args:
+            embeddings: 句子嵌入 [batch_size, hidden_dim]
+            labels: 标签 [batch_size]
+            temperature: 温度参数
+            
+        Returns:
+            loss: 对比学习损失
+        """
+        if temperature is None:
+            temperature = self.temperature
+            
+        batch_size = embeddings.shape[0]
+        
+        # 获取对比学习投影
+        projections = self.contrastive_projection(embeddings)  # [batch_size, projection_dim]
+        
+        # 计算相似度矩阵（对比学习相似度矩阵，与字符相似度是两个概念）
+        similarity_matrix = torch.matmul(projections, projections.T) / temperature  # [batch_size, batch_size]
+        
+        # 创建标签掩码
+        labels = labels.unsqueeze(1)  # [batch_size, 1]
+        label_mask = torch.eq(labels, labels.T).float()  # [batch_size, batch_size]
+        
+        # 移除对角线（自己与自己的相似度）
+        identity_mask = torch.eye(batch_size, device=self.device)
+        label_mask = label_mask * (1 - identity_mask)
+        
+        # 正样本掩码（同类别）
+        positive_mask = label_mask
+        # 负样本掩码（不同类别）
+        negative_mask = (1 - label_mask) * (1 - identity_mask)
+        
+        # 计算对比损失
+        exp_sim = torch.exp(similarity_matrix)
+        
+        # 对于每个样本，计算其正样本和负样本的损失
+        loss = 0.0
+        num_positive_pairs = 0
+        
+        for i in range(batch_size):
+            # 当前样本的正样本
+            positive_indices = torch.where(positive_mask[i] > 0)[0]
+            
+            if len(positive_indices) == 0:
+                continue
+                
+            # 分母：当前样本与所有其他样本的相似度（除了自己）
+            denominator = torch.sum(exp_sim[i] * (1 - identity_mask[i]))
+            
+            # 对每个正样本计算损失
+            for pos_idx in positive_indices:
+                numerator = exp_sim[i, pos_idx]
+                loss += -torch.log(numerator / (denominator + 1e-8))
+                num_positive_pairs += 1
+        
+        if num_positive_pairs > 0:
+            loss = loss / num_positive_pairs
+        
+        return loss
+
+    def create_contrastive_pairs(self, texts, labels, batch_size):
+        """
+        创建对比学习的样本对
+        
+        Args:
+            texts: 文本列表
+            labels: 标签列表
+            batch_size: 批次大小
+            
+        Returns:
+            paired_texts: 配对的文本
+            paired_labels: 配对的标签
+        """
+        # 按标签分组
+        spam_texts = [text for text, label in zip(texts, labels) if label == "spam"]
+        normal_texts = [text for text, label in zip(texts, labels) if label == "normal"]
+        
+        paired_texts = []
+        paired_labels = []
+        
+        # 确保每个批次都有正负样本
+        for _ in range(batch_size // 2):
+            if spam_texts and normal_texts:
+                # 添加垃圾文本
+                paired_texts.append(random.choice(spam_texts))
+                paired_labels.append("spam")
+                
+                # 添加正常文本
+                paired_texts.append(random.choice(normal_texts))
+                paired_labels.append("normal")
+        
+        # 如果批次大小是奇数，随机添加一个
+        if len(paired_texts) < batch_size:
+            all_texts = spam_texts + normal_texts
+            all_labels = ["spam"] * len(spam_texts) + ["normal"] * len(normal_texts)
+            idx = random.randint(0, len(all_texts) - 1)
+            paired_texts.append(all_texts[idx])
+            paired_labels.append(all_labels[idx])
+        
+        return paired_texts[:batch_size], paired_labels[:batch_size]
+
     def fit(self, texts, labels, chinese_characters, chinese_characters_count, 
             sim_mat, test_size=0.5, random_state=42,
             batch_size=32, epochs=5, learning_rate=0.001):
         """
         训练判别器模型
         """
-        
+        # 检查标签格式
+        if not all(label in ["spam", "normal"] for label in labels):
+            raise ValueError("标签必须为 'spam' 或 'normal'")
         
         # 确保模型参数在正确设备上
         self.to(self.device)
@@ -187,7 +315,6 @@ class SpamDiscriminator(nn.Module):
         
         print("生成词向量和字符向量")
         self.w2v_vectors = self._generate_w2v_vectors(tokenized_texts)
-        
         self.char_vectors = self._generate_char_vectors(
             chinese_characters, self.w2v_vectors, sim_mat, 
             tokenized_texts, chinese_characters_count
@@ -200,26 +327,32 @@ class SpamDiscriminator(nn.Module):
         )
         train_texts = [texts[i] for i in train_indices]
         test_texts = [texts[i] for i in test_indices]
-        train_labels_tensor = torch.tensor([1.0 if label == "1" else 0.0 
+        train_labels_tensor = torch.tensor([1.0 if label == "spam" else 0.0 
                                         for label in train_labels_split], 
                                         dtype=torch.float32, device=self.device)
         
         history = {
-            "train_loss": [], "train_acc": [], "test_loss": [], "test_acc": []
+            "train_loss": [], "train_acc": [], "test_loss": [], "test_acc": [],
+            "contrastive_loss": [], "classification_loss": []
         }
         
         for epoch in range(epochs):
             print(f"\nEpoch {epoch+1}/{epochs}:")
             self.train()
             total_loss = 0
+            total_contrastive_loss = 0
+            total_classification_loss = 0
             correct = 0
             train_shuffle_indices = list(range(len(train_texts)))
             np.random.shuffle(train_shuffle_indices)
             
             for i in range(0, len(train_shuffle_indices), batch_size):
-                batch_indices = train_shuffle_indices[i:i+batch_size]
-                batch_texts = [train_texts[idx] for idx in batch_indices]
-                batch_labels = train_labels_tensor[batch_indices]
+                batch_texts, batch_labels_str = self.create_contrastive_pairs(
+                    train_texts, train_labels_split, batch_size
+                )
+                batch_labels = torch.tensor([1.0 if label == "spam" else 0.0 
+                                           for label in batch_labels_str], 
+                                           dtype=torch.float32, device=self.device)
                 
                 # 生成句子向量（已经应用了自注意力）
                 batch_sentence_vectors = self._generate_sentence_vectors_with_attention(batch_texts)
@@ -230,24 +363,35 @@ class SpamDiscriminator(nn.Module):
                 # 直接用于分类，不再需要额外的自注意力层
                 predictions = self.classifier(batch_sentence_tensors).squeeze(-1)  # [batch_size]
                 
-                loss = criterion(predictions, batch_labels)
+                classification_loss = criterion(predictions, batch_labels)
+
+                contrastive_loss = self.contrastive_loss(batch_sentence_tensors, batch_labels)
+
+                loss = (1 - self.contrastive_weight) * classification_loss + \
+                                     self.contrastive_weight * contrastive_loss
                 loss.backward()
                 optimizer.step()
                 
                 total_loss += loss.item()
+                total_contrastive_loss += contrastive_loss.item()
+                total_classification_loss += classification_loss.item()
                 predictions_binary = (predictions >= 0.5).float()
                 correct += (predictions_binary == batch_labels).sum().item()
             
             train_loss = total_loss / (len(train_shuffle_indices) / batch_size)
+            avg_contrastive_loss = total_contrastive_loss / (len(train_shuffle_indices) / batch_size)
+            avg_classification_loss = total_classification_loss / (len(train_shuffle_indices) / batch_size)
             train_acc = correct / len(train_texts)
             history["train_loss"].append(train_loss)
+            history["contrastive_loss"].append(avg_contrastive_loss)
+            history["classification_loss"].append(avg_classification_loss)
             history["train_acc"].append(train_acc)
             
             test_loss, test_acc = self.evaluate(test_texts, test_labels_split)
             history["test_loss"].append(test_loss)
             history["test_acc"].append(test_acc)
             
-            print(f"Epoch {epoch+1}/{epochs}: 训练损失={train_loss:.4f}, 训练准确率={train_acc:.4f}, "
+            print(f"Epoch {epoch+1}/{epochs}: 训练损失={train_loss:.4f}, 对比损失={avg_contrastive_loss:.4f}, 分类损失={avg_classification_loss:.4f}, 训练准确率={train_acc:.4f}, "
                 f"测试损失={test_loss:.4f}, 测试准确率={test_acc:.4f}")
 
         return history, train_texts, test_texts, train_labels_split, test_labels_split
@@ -285,7 +429,7 @@ class SpamDiscriminator(nn.Module):
         """
         self.eval()
         criterion = nn.BCELoss()
-        labels_tensor = torch.tensor([1.0 if label == "1" else 0.0 
+        labels_tensor = torch.tensor([1.0 if label == "spam" else 0.0 
                                     for label in labels], 
                                     dtype=torch.float32, device=self.device)
         with torch.no_grad():
@@ -300,73 +444,9 @@ class SpamDiscriminator(nn.Module):
         with torch.no_grad():
             probabilities = self(texts).cpu().numpy()
             predictions = (probabilities >= 0.5).astype(int)
+        print(f"判别结果: {predictions}")
+        print(f"判别概率: {probabilities}")
         return predictions, probabilities
-
-    def gan_loss(self, real_normal_texts, real_spam_texts, generated_texts):
-        """
-        计算GAN判别器损失
-        
-        Args:
-            real_normal_texts: 真实正常文本列表
-            real_spam_texts: 真实垃圾文本列表
-            generated_texts: 生成器生成的文本列表
-            
-        Returns:
-            loss: 判别器损失
-            real_normal_acc: 真实正常文本判别准确率
-            real_spam_acc: 真实垃圾文本判别准确率
-            generated_acc: 生成文本判别准确率
-        """
-        self.train()
-        real_normal_preds = self(real_normal_texts)
-        real_normal_labels = torch.zeros(len(real_normal_texts), dtype=torch.float32, device=self.device)
-        loss_real_normal = F.binary_cross_entropy(real_normal_preds, real_normal_labels)
-        
-        real_spam_preds = self(real_spam_texts)
-        real_spam_labels = torch.ones(len(real_spam_texts), dtype=torch.float32, device=self.device)
-        loss_real_spam = F.binary_cross_entropy(real_spam_preds, real_spam_labels)
-        
-        generated_preds = self(generated_texts)
-        generated_labels = torch.ones(len(generated_texts), dtype=torch.float32, device=self.device)
-        loss_generated = F.binary_cross_entropy(generated_preds, generated_labels)
-        
-        total_loss = loss_real_normal + loss_real_spam + loss_generated
-        
-        real_normal_acc = ((real_normal_preds < 0.5).float().mean()).item()
-        real_spam_acc = ((real_spam_preds >= 0.5).float().mean()).item()
-        generated_acc = ((generated_preds >= 0.5).float().mean()).item()
-        
-        return total_loss, real_normal_acc, real_spam_acc, generated_acc
-
-    def get_reward_for_generator(self, generated_texts, original_texts=None, lambda_param=0.7):
-        """
-        为生成器提供奖励信号
-        
-        reward = λ * (1-D(x̂)) + (1-λ) * similarity(x, x̂)
-        
-        Args:
-            generated_texts: 生成器生成的文本列表
-            original_texts: 原始文本列表(用于计算相似度)
-            lambda_param: 平衡因子
-            
-        Returns:
-            rewards: 生成文本的奖励值
-        """
-        self.eval()
-        
-        with torch.no_grad():
-            # 判别器打分(欺骗成功)
-            discriminator_scores = self(generated_texts).cpu().numpy()
-            deception_reward = 1 - discriminator_scores  # 欺骗判别器的奖励
-            
-            # 如果提供了原始文本，则计算相似度奖励
-            if original_texts:
-                similarities = self._compute_text_similarities(original_texts, generated_texts)
-                rewards = lambda_param * deception_reward + (1 - lambda_param) * similarities
-            else:
-                rewards = deception_reward
-                
-        return rewards
     
     def _compute_text_similarities(self, original_texts, generated_texts):
         """
