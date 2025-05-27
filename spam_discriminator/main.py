@@ -6,6 +6,7 @@ import os
 # 导入垃圾文本判别器类
 from spam_discriminator import SpamDiscriminator  
 from utils import *  
+from ContrastiveSpamDiscriminator import ContrastiveSpamDiscriminator
 
 # 读取数据集
 def read_data(filename):
@@ -46,18 +47,42 @@ def main():
     print(f"读取了 {len(texts)} 条数据")
     
     # 统计汉字并加载汉字数据
-    print("正在处理汉字数据...")
-    chinese_characters, chinese_characters_count, chinese_characters_code = count_chinese_characters(texts, hanzi_path)
+    print("正在处理汉字数据")
+    cache_dir = "./数据集/cache"
+    os.makedirs(cache_dir, exist_ok=True)  # 创建缓存目录
     
-    if not chinese_characters:
-        print("错误: 没有加载到汉字数据!")
-        return
+    # 定义缓存文件路径
+    hanzi_stats_cache = os.path.join(cache_dir, "hanzi_stats.pkl")
+    sim_mat_cache = os.path.join(cache_dir, "sim_mat.npy")    
+    # 尝试加载缓存的汉字统计
+    if os.path.exists(hanzi_stats_cache):
+        print("检测到汉字统计缓存，正在加载...")
+        with open(hanzi_stats_cache, "rb") as f:
+            (chinese_characters, 
+             chinese_characters_count, 
+             chinese_characters_code) = pickle.load(f)
+    else:
+        print("未找到汉字统计缓存，正在计算...")
+        chinese_characters, chinese_characters_count, chinese_characters_code = count_chinese_characters(texts, hanzi_path)
+        # 保存结果到缓存
+        with open(hanzi_stats_cache, "wb") as f:
+            pickle.dump((chinese_characters, 
+                        chinese_characters_count, 
+                        chinese_characters_code), f)
+        print("汉字统计结果已缓存")
     
     print(f"加载了 {len(chinese_characters)} 个汉字")
     
     # 计算相似度矩阵
     print("正在计算汉字相似度矩阵...")
-    sim_mat = compute_sim_mat(chinese_characters, chinese_characters_code)
+    if os.path.exists(sim_mat_cache):
+        print("检测到相似度矩阵缓存，正在加载...")
+        sim_mat = np.load(sim_mat_cache)
+    else:
+        print("未找到相似度矩阵缓存，正在计算...")
+        sim_mat = compute_sim_mat(chinese_characters, chinese_characters_code)
+        np.save(sim_mat_cache, sim_mat)
+        print("相似度矩阵已缓存")
     
     # 转换标签
     labels = ["spam" if tag == "1" else "normal" for tag in tags]
@@ -67,7 +92,13 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"使用设备: {device}")
     
-    discriminator = SpamDiscriminator(embedding_dim=100, hidden_dim=128, device=device)
+    discriminator = SpamDiscriminator(
+        embedding_dim=100,
+        hidden_dim=128,
+        temperature=0.1,
+        contrastive_weight=0.2,  # 对比学习权重
+        device=device
+    )
     
     # 训练判别器
     print("开始训练判别器...")
@@ -81,7 +112,7 @@ def main():
         test_size=0.2,  # 设置测试集比例
         random_state=42,
         batch_size=32,
-        epochs=3
+        epochs=5,
     )
     
     # 评估模型性能
