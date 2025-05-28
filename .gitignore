@@ -1,3 +1,5 @@
 generator/data/
 *.pt
 *.pkl
+data/cache/*
+models/bert-base-chinese/*
