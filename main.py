@@ -579,7 +579,7 @@ def main_test():
 
 
 if __name__ == "__main__":
-    mode = "test"
+    mode = "gan"
     if mode == "gan":
         main_gan()
     elif mode == "aug":
