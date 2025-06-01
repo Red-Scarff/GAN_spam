@@ -7,10 +7,12 @@ import random
 import os
 from tqdm import tqdm
 import pickle
+import re
 from generator.generator import Generator, ReplacementPolicy
 from discriminator.ssc_similarity import computeSSCSimilarity
 from discriminator.utils import load_chinese_characters, count_chinese_characters, compute_sim_mat
 from discriminator.discriminator import SpamDiscriminator
+from sklearn.metrics import confusion_matrix, classification_report
 
 
 def read_data(filename):
@@ -28,6 +30,72 @@ def read_data(filename):
     labels = ["spam" if tag == "1" else "normal" for tag in tags]
 
     return labels, texts
+
+def read_data_gen(filename):
+    try:
+        with open(filename, "r", encoding="utf-8") as f:
+            text_data = f.readlines()
+    except FileNotFoundError:
+        print(f"错误: 文件 {filename} 不存在")
+        return [], []
+
+    # 使用空格分隔，处理可能的序号
+    dataset = []
+    for s in text_data:
+        s = s.strip()
+        if not s:  # 跳过空行
+            continue
+        # 使用空格分割，限制分割一次
+        parts = s.split(" ", 1)
+        if len(parts) == 2 and parts[1].strip():
+            # 移除文本开头的序号（如 "1."）
+            text = re.sub(r'^\d+\.\s*', '', parts[1]).strip()
+            dataset.append([parts[0], text])
+
+    tag = [data[0] for data in dataset]
+    text = [data[1] for data in dataset]
+
+    return tag, text
+
+def read_generated_files_in_folder(folder_path):
+        """
+        读取指定文件夹中所有名字中带有 "generated" 的 .txt 文件。
+
+        Args:
+            folder_path (str): 要搜索的文件夹路径。
+
+        Returns:
+            tuple: 包含两个列表的元组 (all_tags, all_texts)。
+                   all_tags: 从所有匹配文件中读取到的所有标签。
+                   all_texts: 从所有匹配文件中读取到的所有文本内容。
+                   如果文件夹不存在或没有找到匹配的文件，则返回 ([], [])。
+        """
+        all_tags = []
+        all_texts = []
+
+        if not os.path.isdir(folder_path):
+            print(f"错误: 文件夹 {folder_path} 不存在或不是一个有效的目录。")
+            return [], []
+
+        # 遍历文件夹中的所有文件
+        for filename in os.listdir(folder_path):
+            # 检查文件名是否包含 "generated" 且以 ".txt" 结尾
+            if "generated" in filename and filename.endswith(".txt"):
+                file_path = os.path.join(folder_path, filename)
+                print(f"正在读取文件: {file_path}")
+                
+                # 调用 read_data 方法读取单个文件
+                tags, texts = read_data_gen(file_path)
+                
+                # 将读取到的标签和文本添加到总列表中
+                all_tags.extend(tags)
+                all_texts.extend(texts)
+        
+        if not all_tags and not all_texts:
+            print(f"在文件夹 {folder_path} 中没有找到名字中带有 'generated' 的 .txt 文件。")
+
+        return all_tags, all_texts
+
 
 
 def prepare_similarity_function(chinese_characters_code):
@@ -207,12 +275,8 @@ class SpamGAN:
                 # === 训练生成器 ===
                 g_result = self.train_generator(batch_spam_texts)
                 epoch_g_loss += g_result["gen_loss"]
-
                 # 获取生成的文本
-                generated_spam_texts = []
-                for text in batch_spam_texts:
-                    generated_text = self.generator.generate(text, self.device)
-                    generated_spam_texts.append(generated_text)
+                generated_spam_texts = g_result["texts"]
 
                 # === 训练判别器 ===
                 # 构建判别器训练数据：正常文本(label=0) + 真实垃圾文本(label=1) + 生成的文本(label=1)
@@ -223,8 +287,13 @@ class SpamGAN:
                     + ["spam"] * len(generated_spam_texts)
                 )
 
-                d_result = self.train_discriminator(d_train_texts, d_train_labels)
-                epoch_d_loss += d_result["dis_loss"]
+                if epoch == 0:
+                    if(step < 50):
+                        d_result = self.train_discriminator(d_train_texts, d_train_labels)
+                        epoch_d_loss += d_result["dis_loss"]
+                else:
+                    d_result = self.train_discriminator(d_train_texts, d_train_labels)
+                    epoch_d_loss += d_result["dis_loss"]
 
                 # 更新进度条
                 progress_bar.set_postfix(
@@ -312,26 +381,26 @@ class SpamGAN:
             print("生成器模型已加载")
 
 
-def main():
+def main_gan():
     # 配置参数
     config = {
         "discriminator": {
             "embedding_dim": 100,
-            "hidden_dim": 128,
+            "hidden_dim": 256,
             "dynamic_threshold": True,
             "temperature": 0.1,
-            "contrastive_weight": 0.3,
+            "contrastive_weight": 0.5,
             "learning_rate": 0.001,
         },
         "generator": {
             "hidden_dim": 768,
-            "lambda_sim": 0.3,
+            "lambda_sim": 1,
             "base_model_name": "/root/nfs/GAN_spam/models/bert-base-chinese",
             "learning_rate": 5e-5,
         },
         "gan": {
-            "epochs": 5,
-            "spam_batch_size": 32,
+            "epochs": 6,
+            "spam_batch_size": 16,
             "normal_batch_size": 32,
         },
     }
@@ -374,7 +443,146 @@ def main():
     gan.save_models()
 
     print("\n训练完成！")
+    
+def main_aug():
+
+    # 设置数据路径
+    dataset_path = "./data/dataset.txt"
+    hanzi_path = "./data/hanzi.txt"
+
+    # 检查文件路径是否存在
+    if not os.path.exists(dataset_path):
+        print(f"错误: 数据集文件 {dataset_path} 不存在!")
+        return
+
+    if not os.path.exists(hanzi_path):
+        print(f"错误: 汉字文件 {hanzi_path} 不存在!")
+        return
+
+    # 读取数据
+    print("正在读取数据...")
+    tags, texts = read_data(dataset_path)
+
+
+    # # 增强数据读取
+    # tags_gen, texts_gen = read_generated_files_in_folder("./data_gen")
+
+    # tags.extend(tags_gen)
+    # texts.extend(texts_gen)
+    # print(f"合并后总数据量: {len(tags)}")
+    
+
+
+    if not tags or not texts:
+        print("错误: 没有读取到数据!")
+        return
+
+    print(f"读取了 {len(texts)} 条数据")
+
+    cache_dir = "data/cache"
+
+    os.makedirs(cache_dir, exist_ok=True)  # 创建缓存目录
+
+    # 定义缓存文件路径
+    hanzi_stats_cache = os.path.join(cache_dir, "hanzi_stats.pkl")
+    sim_mat_cache = os.path.join(cache_dir, "discriminator_sim_mat.npy")
+    # 尝试加载缓存的汉字统计
+    if os.path.exists(hanzi_stats_cache):
+        print("检测到汉字统计缓存，正在加载...")
+        with open(hanzi_stats_cache, "rb") as f:
+            (chinese_characters, chinese_characters_count, chinese_characters_code) = pickle.load(f)
+    else:
+        print("未找到汉字统计缓存，正在计算...")
+        chinese_characters, chinese_characters_count, chinese_characters_code = count_chinese_characters(
+            texts, hanzi_path
+        )
+        # 保存结果到缓存
+        with open(hanzi_stats_cache, "wb") as f:
+            pickle.dump((chinese_characters, chinese_characters_count, chinese_characters_code), f)
+        print("汉字统计结果已缓存")
+
+    print(f"加载了 {len(chinese_characters)} 个汉字")
+
+    # 计算相似度矩阵
+    print("正在计算汉字相似度矩阵...")
+    if os.path.exists(sim_mat_cache):
+        print("检测到相似度矩阵缓存，正在加载...")
+        sim_mat = np.load(sim_mat_cache)
+    else:
+        print("未找到相似度矩阵缓存，正在计算...")
+        sim_mat = compute_sim_mat(chinese_characters, chinese_characters_code)
+        np.save(sim_mat_cache, sim_mat)
+        print("相似度矩阵已缓存")
+
+    # 转换标签
+    labels = ["spam" if tag == "1" else "normal" for tag in tags]
+
+    # 初始化判别器
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"使用设备: {device}")
+
+    discriminator = SpamDiscriminator(
+        embedding_dim=100, hidden_dim=256, temperature=0.1, contrastive_weight=0.5, device=device  # 对比学习权重
+    )
+
+    # 训练判别器
+    print("开始训练判别器...")
+
+    print("正在训练模型...（有数据增强！）")
+    history, train_texts, test_texts, train_labels, test_labels = discriminator.fit_aug(
+        texts=texts,  # 传入所有文本
+        labels=labels,  # 传入所有标签
+        chinese_characters=chinese_characters,
+        chinese_characters_count=chinese_characters_count,
+        sim_mat=sim_mat,
+        test_size=0.2,  # 设置测试集比例
+        random_state=42,
+        batch_size=32,
+        epochs=20,
+    )
+
+    # 评估模型性能
+    print("\n最终模型评估:")
+    test_loss, test_acc = discriminator.evaluate(test_texts, test_labels)
+    print(f"测试损失: {test_loss:.4f}, 测试准确率: {test_acc:.4f}")
+
+    # 测试判别功能
+    print("\n测试判别功能:")
+    sample_texts = test_texts[:10]  # 取10个样本进行测试
+    predictions, probabilities = discriminator.discriminate(sample_texts)
+
+    for i, (text, pred, prob) in enumerate(zip(sample_texts, predictions, probabilities)):
+        label = "垃圾文本" if pred == 1 else "正常文本"
+        print(f"样本 {i+1}: '{text[:20]}...' - 预测: {label}, 概率: {prob:.4f}")
+
+    # 保存模型
+    save_path = "./models/spam_discriminator_model_aug_e10.pth"
+    discriminator.save(save_path)
+    print(f"\n模型已保存到 {save_path}")
+
+    
+def main_test():
+    dataset_path = "./data/dataset.txt"
+    tags, texts = read_data(dataset_path)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # save_path = "./models/spam_discriminator_model_aug_e10.pth"
+    save_path = "./models/discriminator3(256 epoch5).pth"
+    
+    # 测试模型加载
+    print("\n测试模型加载:")
+    loaded_discriminator = SpamDiscriminator.load(save_path, device)
+    predictions, _ = loaded_discriminator.discriminate(texts)
+    tags = [1 if tag == "spam" else 0 for tag in tags]
+    report = classification_report(np.array(tags), np.array(predictions), digits=4)
+    print("分类报告:")
+    print(report)
 
 
 if __name__ == "__main__":
-    main()
+    mode = "test"
+    if mode == "gan":
+        main_gan()
+    elif mode == "aug":
+        main_aug()
+    elif mode == "test":
+        main_test()

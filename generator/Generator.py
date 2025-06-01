@@ -127,6 +127,8 @@ class Generator(nn.Module):
             prob_normal = 1 - torch.tensor(prob_spam, dtype=torch.float32, device=input_ids.device)  # [B]
 
         # === policy gradient loss ===
+        log_prob_total = log_prob_total / 100
+        prob_normal = prob_normal * 7
         rl_loss = -(log_prob_total * prob_normal).mean()
 
         # === similarity loss ===
@@ -140,9 +142,9 @@ class Generator(nn.Module):
         sim_scores = self.sim_matrix[orig_ids].to(rep_probs.device)  # [N, V]
         replace_probs_flat = rep_probs[valid_mask]  # [N, V]
         sim_loss = ((1.0 - sim_scores) * replace_probs_flat).sum() / valid_mask.sum()
-
+        
         total_loss = rl_loss + self.lambda_sim * sim_loss
-
+    
         return {
             "gen_loss": total_loss,
             "rl_loss": rl_loss,
@@ -170,7 +172,7 @@ class Generator(nn.Module):
             正常文本
 
         output:
-            替换后文本
+            替换后文本(相似度策略)
         """
         self.eval()
         with torch.no_grad():
@@ -186,7 +188,7 @@ class Generator(nn.Module):
             mask_probs = torch.sigmoid(mask_logits)
             rep_logits = self.replace_head(seq_out)
             # rep_probs = F.softmax(rep_logits, dim=-1)
-            rep_probs = F.gumbel_softmax(rep_logits, tau=0.5, hard=False)
+            rep_probs = F.gumbel_softmax(rep_logits, tau=0.5, hard=True)
             gen_ids = []
             for t in range(input_ids.size(1)):
                 orig_id = input_ids[0, t].item()

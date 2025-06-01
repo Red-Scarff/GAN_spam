@@ -7,7 +7,8 @@ import re
 from gensim.models import Word2Vec
 from sklearn.metrics import confusion_matrix, classification_report
 import random
-
+from .data_augmentation import DataAugmentation
+import os
 
 class L2Norm(nn.Module):
     """L2归一化层"""
@@ -71,6 +72,33 @@ class SpamDiscriminator(nn.Module):
 
         # 移动所有参数到指定设备
         self.to(self.device)
+        
+    def read_data(self, filename):
+        try:
+            with open(filename, "r", encoding="utf-8") as f:
+                text_data = f.readlines()
+        except FileNotFoundError:
+            print(f"错误: 文件 {filename} 不存在")
+            return [], []
+
+        # 使用空格分隔，处理可能的序号
+        dataset = []
+        for s in text_data:
+            s = s.strip()
+            if not s:  # 跳过空行
+                continue
+            # 使用空格分割，限制分割一次
+            parts = s.split(" ", 1)
+            if len(parts) == 2 and parts[1].strip():
+                # 移除文本开头的序号（如 "1."）
+                text = re.sub(r'^\d+\.\s*', '', parts[1]).strip()
+                dataset.append([parts[0], text])
+
+        tag = [data[0] for data in dataset]
+        text = [data[1] for data in dataset]
+
+        return tag, text
+
 
     def _generate_w2v_vectors(self, tokenized_texts, d=100):
         """
@@ -482,6 +510,235 @@ class SpamDiscriminator(nn.Module):
             print(
                 f"Epoch {epoch+1}/{epochs}: 训练损失={train_loss:.4f}, 对比损失={avg_contrastive_loss:.4f}, 分类损失={avg_classification_loss:.4f}, 训练准确率={train_acc:.4f}, "
                 f"测试损失={test_loss:.4f}, 测试准确率={test_acc:.4f}"
+            )
+
+        return history, train_texts, test_texts, train_labels_split, test_labels_split
+    
+    def fit_aug(
+        self,
+        texts,
+        labels,
+        chinese_characters,
+        chinese_characters_count,
+        sim_mat,
+        test_size=0.5,
+        random_state=42,
+        batch_size=32,
+        epochs=5,
+        learning_rate=0.001,
+    ):
+        """
+        训练判别器模型
+        """
+        # 检查标签格式
+        if not all(label in ["spam", "normal"] for label in labels):
+            raise ValueError("标签必须为 'spam' 或 'normal'")
+
+        # 确保模型参数在正确设备上
+        self.to(self.device)
+
+        optimizer = torch.optim.Adam(self.parameters(), lr=learning_rate)
+        criterion = nn.BCELoss()
+
+        print("文本预处理")
+        cleaned_texts = self._clean_texts(texts)
+        tokenized_texts = self._tokenize_and_remove_stopwords(cleaned_texts)
+
+        print("生成词向量和字符向量")
+        self.w2v_vectors = self._generate_w2v_vectors(tokenized_texts)
+        self.char_vectors = self._generate_char_vectors(
+            chinese_characters, self.w2v_vectors, sim_mat, tokenized_texts, chinese_characters_count
+        )
+
+        print("划分训练集和测试集...")
+        from sklearn.model_selection import train_test_split
+
+        train_indices, test_indices, train_labels_split, test_labels_split = train_test_split(
+            list(range(len(texts))), labels, test_size=test_size, random_state=random_state
+        )
+        train_texts = [texts[i] for i in train_indices]
+        test_texts = [texts[i] for i in test_indices]
+
+        # 按标签分组原始数据
+        train_spam_texts = [text for text, label in zip(train_texts, train_labels_split) if label == "spam"]
+        train_normal_texts = [text for text, label in zip(train_texts, train_labels_split) if label == "normal"]
+            
+
+        train_labels_tensor = torch.tensor(
+            [1.0 if label == "spam" else 0.0 for label in train_labels_split], dtype=torch.float32, device=self.device
+        )
+
+        history = {
+            "train_loss": [],
+            "train_acc": [],
+            "test_loss": [],
+            "test_acc": [],
+            "contrastive_loss": [],
+            "classification_loss": [],
+        }
+
+        augmented_file = "./data_gen/spam_analysis_results_generated.txt"
+        aug_spam_texts, aug_normal_texts = [], []
+
+        best_test_acc = 0.93
+        for epoch in range(epochs):
+            print(f"\nEpoch {epoch+1}/{epochs}:")
+            self.train()
+            total_loss = 0
+            total_contrastive_loss = 0
+            total_classification_loss = 0
+            correct = 0
+
+            if os.path.exists(augmented_file):
+                train_labels_aug_bin, train_texts_aug = self.read_data(augmented_file)
+                train_labels_aug = ["spam" if label == "1" else "normal" for label in train_labels_aug_bin]
+                
+                # 使用extend，保留前面epoch的生成
+                aug_spam_texts.extend(
+                    [text for text, label in zip(train_texts_aug, train_labels_aug) if label == "spam"]
+                )
+                aug_normal_texts.extend(
+                    [text for text, label in zip(train_texts_aug, train_labels_aug) if label == "normal"]
+                )
+                print(f"原始训练集大小: {len(train_texts)}")
+                print(f"增强数据 - 垃圾样本: {len(aug_spam_texts)}, 正常样本: {len(aug_normal_texts)}")
+            else:
+                print(f"警告: 增强数据文件 {augmented_file} 不存在，跳过增强数据使用")
+
+
+
+
+            train_shuffle_indices = list(range(len(train_texts)))
+            np.random.shuffle(train_shuffle_indices)
+
+            for i in range(0, len(train_shuffle_indices), batch_size):
+                # 构造批次：一半增强数据，一半原始数据
+                batch_texts = []
+                batch_labels_str = []
+                add_num = batch_size // 8 # 控制每个batch中增加数据数量
+
+                # 添加增强数据（优先）
+                for _ in range(add_num):  # 每类样本取 add_num//2
+                    if aug_spam_texts:
+                        batch_texts.append(random.choice(aug_spam_texts))
+                        batch_labels_str.append("spam")
+                    elif train_spam_texts:
+                        batch_texts.append(random.choice(train_spam_texts))
+                        batch_labels_str.append("spam")
+
+                    if aug_normal_texts:
+                        batch_texts.append(random.choice(aug_normal_texts))
+                        batch_labels_str.append("normal")
+                    elif train_normal_texts:
+                        batch_texts.append(random.choice(train_normal_texts))
+                        batch_labels_str.append("normal")
+
+                # 添加原始数据
+                for _ in range(batch_size-add_num):  # 每类样本取 add_num // 2
+                    if train_spam_texts:
+                        batch_texts.append(random.choice(train_spam_texts))
+                        batch_labels_str.append("spam")
+                    if train_normal_texts:
+                        batch_texts.append(random.choice(train_normal_texts))
+                        batch_labels_str.append("normal")
+
+                # 补充到 batch_size，保持交替规律
+                while len(batch_texts) < batch_size:
+                    if len(batch_texts) % 2 == 0 and train_spam_texts:
+                        batch_texts.append(random.choice(train_spam_texts))
+                        batch_labels_str.append("spam")
+                    elif train_normal_texts:
+                        batch_texts.append(random.choice(train_normal_texts))
+                        batch_labels_str.append("normal")
+                    else:
+                        break
+
+                # 确保批次大小正确
+                batch_texts = batch_texts[:batch_size]
+                batch_labels_str = batch_labels_str[:batch_size]
+
+                # 使用 create_contrastive_pairs 调整样本（保持原始逻辑）
+                batch_texts, batch_labels_str = self.create_contrastive_pairs(
+                    batch_texts, batch_labels_str, batch_size
+                )
+
+                batch_labels = torch.tensor(
+                    [1.0 if label == "spam" else 0.0 for label in batch_labels_str],
+                    dtype=torch.float32,
+                    device=self.device,
+                )
+
+                # print(batch_texts, batch_labels)
+                # print(len(batch_texts))
+                # exit()
+
+                # 生成句子向量（已经应用了自注意力）
+                batch_sentence_vectors = self._generate_sentence_vectors_with_attention(batch_texts)
+                batch_sentence_tensors = torch.stack(batch_sentence_vectors)  # [batch_size, hidden_dim]
+
+                optimizer.zero_grad()
+
+                # 直接用于分类，不再需要额外的自注意力层
+                predictions = self.classifier(batch_sentence_tensors).squeeze(-1)  # [batch_size]
+
+                classification_loss = criterion(predictions, batch_labels)
+
+                contrastive_loss = self.contrastive_loss(batch_sentence_tensors, batch_labels)
+
+                loss = (1 - self.contrastive_weight) * classification_loss + self.contrastive_weight * contrastive_loss
+                loss.backward()
+                optimizer.step()
+
+                total_loss += loss.item()
+                total_contrastive_loss += contrastive_loss.item()
+                total_classification_loss += classification_loss.item()
+                predictions_binary = (predictions >= 0.5).float()
+                correct += (predictions_binary == batch_labels).sum().item()
+
+            train_loss = total_loss / (len(train_shuffle_indices) / batch_size)
+            avg_contrastive_loss = total_contrastive_loss / (len(train_shuffle_indices) / batch_size)
+            avg_classification_loss = total_classification_loss / (len(train_shuffle_indices) / batch_size)
+            train_acc = correct / len(train_texts)
+            history["train_loss"].append(train_loss)
+            history["contrastive_loss"].append(avg_contrastive_loss)
+            history["classification_loss"].append(avg_classification_loss)
+            history["train_acc"].append(train_acc)
+
+            test_loss, test_acc = self.evaluate(test_texts, test_labels_split)
+            history["test_loss"].append(test_loss)
+            history["test_acc"].append(test_acc)
+
+            print(
+                f"Epoch {epoch+1}/{epochs}: 训练损失={train_loss:.4f}, 对比损失={avg_contrastive_loss:.4f}, 分类损失={avg_classification_loss:.4f}, 训练准确率={train_acc:.4f}, "
+                f"测试损失={test_loss:.4f}, 测试准确率={test_acc:.4f}"
+            )
+            
+            if(test_acc > best_test_acc):
+                best_test_acc = test_acc
+                self.save(f"./spam_discriminator_model_best_{best_test_acc}.pth")
+            
+            
+            print("进行数据增强")
+            # model_path = "./spam_discriminator_model.pth"
+            # self.save(model_path)  
+            # # 创建分析工具
+            # dataAugmnetation = DataAugmentation(self.load(model_path))
+            dataAugmentation = DataAugmentation(self)
+
+            # 设置API配置
+            dataAugmentation.setup_api_config(
+                api_key='your_api_key',
+                base_url='https://api.deepseek.com/v1'  ,
+                model = "deepseek-reasoner"
+            )
+
+            # 运行完整流程
+            dataAugmentation.run_complete_pipeline(
+                test_texts=train_texts,
+                test_labels=train_labels_split,
+                output_file="./data_gen/spam_analysis_results.txt",
+                num_generate=500, #  生成样本数量，正负各250个，会多次调用api
+                num_to_input=100  # 输入给大模型的样本数量
             )
 
         return history, train_texts, test_texts, train_labels_split, test_labels_split
